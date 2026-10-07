@@ -1,5 +1,6 @@
 from pathlib import Path
 import time
+import math
 
 import cv2
 import mediapipe as mp
@@ -11,6 +12,9 @@ from mediapipe.tasks.python import vision
 HAND_COLORS = {"Left": (180, 70, 255), "Right": (255, 220, 60)}
 FINGERTIPS = ((4, "Thumb"), (8, "Index"))
 
+# Larger values reduce jitter but add more lag. Units: seconds.
+SMOOTHING_TAU = 0.06
+
 model_path = Path(__file__).with_name("hand_landmarker.task")
 options = vision.HandLandmarkerOptions(
     base_options=python.BaseOptions(model_asset_path=str(model_path)),
@@ -21,6 +25,8 @@ options = vision.HandLandmarkerOptions(
 with vision.HandLandmarker.create_from_options(options) as landmarker:
     camera = cv2.VideoCapture(0)
     last_timestamp_ms = -1
+    smoothing_state = {}
+    smoothing_enabled = True
 
     try:
         if not camera.isOpened():
@@ -52,9 +58,18 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
 
                 for tip_row, (index, finger_name) in enumerate(FINGERTIPS):
                     lm = landmarks[index]
+                    key = (hand_name, finger_name)
+                    x, y = lm.x, lm.y
                     if not ambiguous:
-                        fingertip_positions[(hand_name, finger_name)] = (lm.x, lm.y)
-                    point = (round(lm.x * width), round(lm.y * height))
+                        if smoothing_enabled and key in smoothing_state:
+                            previous_x, previous_y, previous_ms = smoothing_state[key]
+                            dt = (timestamp_ms - previous_ms) / 1000.0
+                            alpha = 1.0 - math.exp(-dt / SMOOTHING_TAU)
+                            x = previous_x + alpha * (x - previous_x)
+                            y = previous_y + alpha * (y - previous_y)
+                        smoothing_state[key] = (x, y, timestamp_ms)
+                        fingertip_positions[key] = (x, y)
+                    point = (round(x * width), round(y * height))
                     cv2.circle(frame, point, 10, hand_color, 2, cv2.LINE_AA)
                     cv2.circle(frame, point, 3, (255, 255, 255), -1, cv2.LINE_AA)
                     cv2.putText(frame, f"{hand_name} {finger_name}",
@@ -65,6 +80,10 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
                     cv2.putText(frame, f"{hand_name} {finger_name}: {point}",
                                 (20, 70 + row * 24), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5, hand_color, 1, cv2.LINE_AA)
+
+            # Discard history for missing hands or ambiguous identities.
+            smoothing_state = {key: state for key, state in smoothing_state.items()
+                               if key in fingertip_positions}
 
             ready = len(fingertip_positions) == 4
             if ready:
@@ -90,13 +109,22 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
             color = (0, 255, 0) if ready else (0, 180, 255)
             cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                         0.65, color, 2, cv2.LINE_AA)
+            mode = "ON" if smoothing_enabled else "OFF"
+            cv2.putText(frame, f"Smoothing: {mode} | S: toggle | Q: quit",
+                        (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow("Spider-Gwen - Webcam", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key_pressed = cv2.waitKey(1) & 0xFF
+            if key_pressed == ord("q"):
                 break
+            if key_pressed == ord("s"):
+                smoothing_enabled = not smoothing_enabled
+                smoothing_state.clear()
     finally:
         camera.release()
         cv2.destroyAllWindows()
+
 
 
 
